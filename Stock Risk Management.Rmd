@@ -1,0 +1,467 @@
+---
+title: "Stock Risk Management"
+author: "Yufang Zhang"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warnings = FALSE)
+```
+
+```{r}
+graphics.off()   # Shuts down all open graphics
+rm(list = ls())  # Remove objects from the workspace
+options(warn=-1) # Print warnings if they occur
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+
+## Q1. Import data and calculate log returns
+```{r}
+# load data
+load("ESTX_series-2.RData")
+colnames(df_raw) <- c("date", "return")
+df_raw$date <- as.Date(df_raw$date)
+
+# log return
+return <- log(df_raw[2:nrow(df_raw),2]) - log(df_raw[1:(nrow(df_raw)-1) ,2])
+dates = df_raw$date
+dates = dates[2:length(dates)]
+return <- as.data.frame(return)
+return$date <- dates
+lret = return[,1]
+```
+
+## Q2. Estimate GARCH model with maximum likelihood
+```{r}
+# Define the GARCH likelihood function
+garch_loglik <- function(para, returnVec, output){
+  
+  # Initialize the parameters and take squares so as to ensure that the parameters
+  # are indeed non-negative
+  omega=para[1]^2 
+  alpha=para[2]^2
+  beta=para[3]^2
+  gamma=para[4]^2
+  mu=para[5]^2
+  df=para[6]^2
+  
+  # Determine the model parameters
+  T = length(returnVec)
+  
+  # Set up containers for h and z
+  h = rep(NA, T+1)
+  z = rep(NA, T) 
+  
+  # Initialize with closed form solution value (as given on p.77)
+  h[1] = omega / (1 - beta - alpha*(1+gamma^2))
+  z[1] = (returnVec[1] - mu)/(sqrt(h[1]))
+  
+  # Loop over all dates to fill the container vectors based on the supplied parameter values
+  for (t in 2:T){
+    # Fill the conditional variance
+    h[t] = omega + alpha*h[t-1]*(z[t-1] - gamma)^2 + beta*h[t-1]
+    # Fill the shock vector z
+    z[t] = (returnVec[t] - mu)/(sqrt(h[t]))
+  }
+  
+  # Fill  the final value at t = T+1
+  h[T+1] = omega + beta *h[T] + alpha*h[T]*(z[T]-gamma)^2
+  
+  # Compute the log-likelihood function:
+  Cd <- gamma((df+1)/2)/(gamma(df/2)*sqrt(pi*(df-2)))
+  Log_L2 <- rep(NA, T)
+  Log_L2[1] <- log(Cd/sqrt(h[1])*(1+z[1]^2/(df-2))^(-(1+df)/2))
+  for (t in 2:T){
+    L <- Cd/sqrt(h[t])*(1+z[t]^2/(df-2))^(-(1+df)/2)
+    Log_L <- log(L)
+    Log_L2[t] <- Log_L2[t-1]+ Log_L
+  }
+  
+  # Output loglikelihood value, the conditional variance vector (h) and the shock vector (z)
+  if (output=="loglik"){
+    -Log_L2[8342]
+  } else if (output=="cond_var"){
+    h
+  } else if (output=="shock"){
+    z
+  }
+}
+# Set  initial starting values 
+para0=c(10^(-6), 0.1, 0.8, 0.95, 10^(-4), 7)
+#para0=c(10^(-6), 0.3, 0.3, 10^(-4))#<-try these starting values and observe the change in logLik
+# Since we square the parameter inputs in the function, the input parameters here are in square roots
+mlef <- optim(sqrt(para0), garch_loglik, returnVec=lret, output="loglik", gr = NULL, method = c("Nelder-Mead"))
+
+# Retrieve the optimal parameter estimates and the maximum loglikelihood value
+GARCH_paramter=mlef$par^2
+logLik=-mlef$value
+GARCH_paramter
+logLik
+
+# Calculate long run volatility
+persistence_GARCH = GARCH_paramter[3]+GARCH_paramter[2]*(1+GARCH_paramter[4]^2) 
+LRV = GARCH_paramter[1]/(1-persistence_GARCH)
+sqrt(LRV*252)
+sd(lret)*sqrt(252)
+
+# Plot daily volatility
+h_estimated <- garch_loglik(mlef$par, lret, output = "cond_var")
+
+plot(dates, sqrt(h_estimated*252)[1:(length(h_estimated)-1)], type = "l", 
+     col ="red3", 
+     xlab = "Date",
+     ylab = "conditional variance",
+     main = 'GARCH Conditional Variance',
+     lwd = 2)
+```
+$\alpha$ is the coefficient of the lagged squared error term, representing the reactivity of the volatility to market shocks. The lower the $\alpha$, the less the impact of a shock on future volatility.$\beta$ shows how much of the previous period's volatility carries over to the current period. A high $\beta$ like this one suggests a high degree of volatility clustering, meaning periods of high volatility are likely to be followed by periods of high volatility and vice versa. The log-likelihood measures the goodness-of-fit of a statistical model. Higher absolute values indicate a better fit.
+
+## Q3. Compare the GARCH model from Q2 with the model from the first Assignment with normal shocks
+
+We can see that the parameters are quite close for both models, with slight differences. This suggests that both models attribute similar weights to past variance and squared residuals. The Student-t model, however, has an additional degree of freedom (d=6.89) in GARCH_paramter , which accounts for the heavy-tailed nature of its distribution.
+
+The long-run variance, measured as the square root of LRV multiplied by 252, is 0.256 for the Student-t model and 0.231 for the Normal model. This suggests that the Student-t model predicts a slightly higher long-term volatility than the Normal model, which may be due to the “heavier tails” of the Student-t distribution allowing for more extreme outcomes.
+
+The standard deviation of the returns, scaled by square root of 252, is the same for both models (0.211). This suggests that the overall level of volatility is similar in the two models. However, the Student-t model might be better at capturing periods of extremely high or low volatility due to the heavier tails of its distribution.
+
+In summary, both models provide similar estimates of volatility, but the Student-t model might be slightly more accurate in predicting periods of high volatility due to its ability to better account for extreme outcomes.
+
+## Q4. Plot
+```{r}
+library(fGarch)
+T = length(lret)
+# create standardized shocks z
+z = (lret - GARCH_paramter[5])/sqrt(h_estimated[1:T])
+# or: z = garch_loglik(mlef$par, lret, output = "shock")
+
+par(mfrow=c(1,2))
+# empirical density of the return shocks z & standardized student-t distribution
+x = (-100:100)/10
+hist(z, breaks = 100, freq = FALSE, main = 'empirical z vs. Student t(df=7)')
+lines(x, dstd(x, mean = 0, sd = 1, nu = 7, log = FALSE), type = "l", 
+      col ="blue3", 
+      lwd = 2)
+
+# QQ plot of the z’s versus the Standardized Student-t distribution
+quantiles = seq(0+1/T/2, 1-1/T/2, length.out = T) #predefined quantile points
+y_val = quantile(z,quantiles) #Empirical quantiles; standardize by -mean and /sd(z) (close to zero and one in this case)
+x_val = qt(quantiles,df = 7)#Theoretical quantiles
+
+plot(x_val,y_val, main="QQ plot",
+     xlab="Theoretical quantiles", ylab="Empirical quantiles", col="blue3") 
+lines(seq(-5,5,length.out = T), seq(-5,5,length.out = T), col = "red3") #45 degree line
+
+```
+The fitted Student-t distribution closely matches the empirical density of the return shocks, suggests that the return shocks follow a Student-t distribution. This indicates the return may have “heavy tails,” i.e., they experience extreme values more often than would be expected under a normal distribution.
+
+Also the points in the QQ-plot form a roughly straight line suggests that the return shocks follow a Student-t distribution, which further confirm the presence of heavy tails in the data.
+
+## Q5. Calculate and plot the 1% VaR and ES for each day using the filtered historical simulation methods with a rolling window of a) 250 days b) 1000 days.
+```{r}
+VaR_FHS_250  = matrix(ncol=1, nrow=T)
+ES_FHS_250  = matrix(ncol=1, nrow=T)
+past_z <- garch_loglik(mlef$par, lret, output = "shock")
+#a)
+N =  250 #window length
+#loop over all t
+for (t in 1:T) {
+  if (t>=N){
+    VaR_FHS_250[t] = -sqrt(h_estimated[t+1]) * quantile(past_z[(t-N+1):t],0.01) * 100
+    ES_FHS_250[t]  = -sqrt(h_estimated[t+1]) * sum(past_z[(t-N+1):t] * (past_z[(t-N+1):t]<quantile(past_z[(t-N+1):t],0.01)))/N/0.01 * 100}
+}
+#b)
+VaR_FHS_1000  = matrix(ncol=1, nrow=T)
+ES_FHS_1000  = matrix(ncol=1, nrow=T)
+N =  1000 #window length
+#loop over all t
+for (t in 1:T) {
+  if (t>=N){
+    VaR_FHS_1000[t] = -sqrt(h_estimated[t+1]) * quantile(past_z[(t-N+1):t],0.01) * 100
+    ES_FHS_1000[t]  = -sqrt(h_estimated[t+1]) * sum(past_z[(t-N+1):t] * (past_z[(t-N+1):t]<quantile(past_z[(t-N+1):t],0.01)))/N/0.01 * 100}
+}
+
+par(mar = c(1,1,1,1))
+plot(dates, VaR_FHS_250[,1], type = "l", 
+     col ="red3", 
+     xlab = "Date",
+     ylab = "1 % VAR",
+     main = '1% VAR using filtered historical simulation',
+     lwd = 2)
+
+lines(dates, VaR_FHS_1000[,1], 
+      col ="blue3", 
+      xlab = "Date",
+      ylab = "1 % VAR",
+      main = '1% VAR using filtered historical simulation',
+      lwd = 2)
+legend(x = "topleft", legend=c("FHS(250)", "FHS(1000)"),
+       col=c("red3", "blue3"),
+       fill = c("red3", "blue3"))
+
+plot(dates, ES_FHS_250[,1], type = "l", 
+     col ="red3", 
+     xlab = "Date",
+     ylab = "1 % ES",
+     main = '1% ES using filitered historical simulation',
+     lwd = 2)
+
+lines(dates, ES_FHS_1000[,1], 
+      col ="blue3", 
+      xlab = "Date",
+      ylab = "1 % ES",
+      main = '1% ES using filtered historical simulation',
+      lwd = 2)
+legend(x = "topleft", legend=c("FHS(250)", "FHS(1000)"),
+       col=c("red3", "blue3"),
+       fill = c("red3","blue3"))
+```
+We can find from the plots that VaR and ES higher in 250-day window than in 1000-day window. This suggests that recent data (i.e., the past 250 days) are more volatile than the longer-term data (the past 1000 days). This might be because the 250-day window gives more weight to recent observations, which can capture recent changes in volatility.
+Also comparing the two plots, we can notice that ES moves higher than VaR, which indicates that when losses occur, they are likely to be significantly large.
+
+```{r}
+?lines()
+```
+
+## Q6.  Calculate the Cornish-Fisher approximation to VaR and ES for each day. Plot with FHS.
+```{r}
+library(moments)
+sr <- scale(lret)
+skew <- skewness(sr)
+kurto <- kurtosis(sr)
+fi <- -2.33
+CF <- fi + skew/6*(fi^2-1) + kurto/24*((fi^3)-3*fi) - (skew^2)/36*(2*(fi^3)-5*fi)
+CF_VAR <- -sqrt(h_estimated) * CF * 100
+Compare <- cbind(VaR_FHS_250,VaR_FHS_1000,as.data.frame(CF_VAR)[-8343,1])
+colnames(Compare) <- c('VAR_250','VAR_1000','CF_VAR')
+# Plot the three VAR 
+plot(dates,Compare[,1], type = "l", 
+     col ="red3", 
+     xlab = "Date",
+     ylab = "1 % VAR",
+     main = '1% CF_VAR VS VAR using filtered historical simulation',
+     lwd = 1)
+lines(dates, Compare[,2], 
+      col ="blue3", 
+      xlab = "Date",
+      ylab = "1 % VAR",
+      lwd = 1)
+lines(dates, Compare[,3], 
+      col ="black", 
+      xlab = "Date",
+      ylab = "1 % CF_VAR",
+      lwd = 1)
+legend(x = "topleft", legend=c("VAR(250)","VAR(1000)" ,"CF_VAR"),
+       col=c("red3", "blue3","black"),
+       fill = c("red3", "blue3","black"))
+```
+We can see from the graph that the Cornish-Fisher VaR is slightly larger than the FHS VaR. This may caused by different capture of tail risk and the influence of sample size. 
+
+The Cornish-Fisher approximation adjusts for skewness and kurtosis in the return distribution, which can cause it to estimate a higher VaR if the returns have heavy tails. This suggests that the Cornish-Fisher approximation may be capturing more of the tail risk than the FHS method. 
+
+The difference between the VaRs from the Cornish-Fisher method and FHS method might also be influenced by the rolling window size. A larger window (e.g., 1000 days) includes more historical information, which might stabilize the estimates if the returns are stationary. Conversely, a smaller window (e.g., 250 days) gives more weight to recent observations, which can be more reactive to recent changes in volatility.
+
+Overall, these results suggest that both methods have their merits, with the Cornish-Fisher approximation potentially capturing more tail risk than the FHS method. This is consistent with the findings in earlier analysis, which suggested that the return shocks followed a Student-t distribution with heavy tails.
+
+## Q7. 1% VaR and ES of your portfolio on Oct 08, 2008
+```{r}
+compare <- as.data.frame(Compare)
+compare$ES_FHS_250 <- ES_FHS_250[,1]
+compare$ES_FHS_1000 <- ES_FHS_1000[,1]
+compare$dates <- dates
+library(dplyr)
+special<- filter(compare,dates=="2008-10-08")
+special
+
+```
+
+## Q8. Estimate HAR model 
+```{r}
+options(scipen=6)
+library(readxl)
+df_new<- read_excel("Chapter5_Data.xlsx", col_names = TRUE)
+df_new <- df_new[-1,]
+df_new <- df_new[-1,]
+filter <- df_new[2:2481,2]
+filter[2481,1] <- NA
+df_new[,6] <- filter[,1]
+names(df_new)[6] <- "RVD,t+1"
+result <- lm(`RVD,t+1` ~ `RVD,t` + `RVW,t` + `RVM,t`, data= df_new)
+log_df <- log(df_new[,-1])
+logresult <- lm(`RVD,t+1` ~ `RVD,t` + `RVW,t` + `RVM,t`, data= log_df)
+
+# a) regression coefficients and R-square
+summary(result)
+summary(logresult)
+
+# b) quasi-log-likelihood
+estimated <- predict(result, newdata = df_new[,3:5], na.action = na.omit)
+obs_filter <- df_new[-(1:20),6]
+Qlike <- estimated[-2461]/obs_filter[-2461,1]-log(estimated[-2461]/obs_filter[-2461,1]) -1
+colnames(Qlike) <- c('QLIKE')
+
+estimated_log <- predict(logresult, newdata = log(df_new[,3:5]), na.action = na.omit)
+obs_filter_log <- log(df_new[-(1:20),6])
+logQlike <- estimated_log[-2461]/obs_filter_log[-2461,1]-log(estimated_log[-2461]/obs_filter_log[-2461,1]) -1
+colnames(logQlike) <- c('QLIKE for log')
+
+# c) mean-squared error
+square_error <- estimated[-2461] - obs_filter[-2461,1]
+mse <- square_error[,1]^2
+square_error_log <- estimated_log[-2461] - obs_filter_log[-2461,1]
+mse_log <- square_error_log[,1]^2
+```
+
+## Q9. Distribution of monthly log returns (21 trading days) of the GARCH model from Question 2
+```{r}
+##9.
+#a)
+N=10^7
+T=21
+h = matrix(NA,T,N)
+R = matrix(NA,T,N)
+z = matrix(rstd(T*N,nu = 7), T, N) 
+h[1,] = 0.003 #initialize variance
+R[1,] = 10^-4 + sqrt(h[1,])*z[1,] #update return
+for (t in 2:T) {
+  h[t,] = 10^-6 + 0.8 *h[t-1,] + 0.1*h[t-1,]*(z[t-1,]-0.95)^2 #update variance
+  R[t,] = 10^-4+sqrt(h[t,])*z[t,] #update return
+}
+
+R_T  = colSums(R,dims=1)
+H_T  = colSums(h,dims=1)
+
+m1_simul_large <- mean(R_T)
+m2_simul_large <- var(R_T)
+m3_simul_large <- skewness(R_T)
+m4_simul_large <- kurtosis(R_T)
+#b)
+m1_analytical <- 21*10^-4
+m2_analytical <- 21*LRV + (0.0030-LRV)*
+  ((1-(0.1+0.1*0.95^2+0.8)^21)/(1-(0.1+0.1*0.95^2+0.8)))
+
+returns_large <- matrix(NA, nrow=100,ncol=10^7)
+var_sum_large <- matrix(NA, nrow=100,ncol=10^7)
+
+for (i in 1:100){
+  N=10^7
+  T=21
+  h = matrix(NA,T,N)
+  R = matrix(NA,T,N)
+  z = matrix(rstd(T*N,nu = 7), T, N) 
+  h[1,] = 0.003 #initialize variance
+  R[1,] = 10^-4 + sqrt(h[1,])*z[1,] #update return
+  for (t in 2:T) {
+    h[t,] = 10^-6 + 0.8 *h[t-1,] + 0.1*h[t-1,]*(z[t-1,]-0.95)^2 #update variance
+    R[t,] = 10^-4+sqrt(h[t,])*z[t,] #update return
+  }
+  
+  returns_large[i,] <- colSums(R,dims=1)
+  var_sum_large[i,] <- colSums(h,dims=1)
+}
+
+#quantify deviation
+library(dplyr)
+sd(apply(returns_large, FUN = mean, MARGIN =1) - m1_analytical)
+sd(apply(returns_large, FUN = var, MARGIN =1) - m2_analytical)
+sd(apply(returns_large, FUN = skewness, MARGIN =1) - m3_simul_large)
+sd(apply(returns_large, FUN = kurtosis, MARGIN =1) - m4_simul_large)
+
+#c)
+returns_small <- matrix(NA, nrow=200,ncol=10^4)
+var_sum_small <- matrix(NA, nrow=200,ncol=10^4)
+
+for (i in 1:200){
+  N=10^4
+  T=21
+  h = matrix(NA,T,N)
+  R = matrix(NA,T,N)
+  z = matrix(rstd(T*N,nu = 7), T, N) 
+  h[1,] = 0.003 #initialize variance
+  R[1,] = 10^-4 + sqrt(h[1,])*z[1,] #update return
+  for (t in 2:T) {
+    h[t,] = 10^-6 + 0.8 *h[t-1,] + 0.1*h[t-1,]*(z[t-1,]-0.95)^2 #update variance
+    R[t,] = 10^-4+sqrt(h[t,])*z[t,] #update return
+  }
+  
+  returns_small[i,] <- colSums(R,dims=1)
+  var_sum_small[i,] <- colSums(h,dims=1)
+}
+
+#quantify deviation
+library(dplyr)
+sd(apply(returns_small, FUN = mean, MARGIN =1) - m1_analytical)
+sd(apply(returns_small, FUN = var, MARGIN =1) - m2_analytical)
+sd(apply(returns_small, FUN = skewness, MARGIN =1) - m3_simul_large)
+sd(apply(returns_small, FUN = kurtosis, MARGIN =1) - m4_simul_large)
+
+#d)
+#repeat this 1000 times and calculate standard error
+m1_mom =  matrix(ncol=1, nrow=1000)
+m2_mom =  matrix(ncol=1, nrow=1000)
+for(i in 1:1000) {
+  N=10^4
+  T=21
+  h = matrix(NA,T,N)
+  R = matrix(NA,T,N)
+  z = matrix(rstd(T*N,nu = 7), T, N) 
+  h[1,] = 0.003 #initialize variance
+  R[1,] = 10^-4 + sqrt(h[1,])*z[1,] #update return
+  for (t in 2:T) {
+    h[t,] = 10^-6 + 0.8 *h[t-1,] + 0.1*h[t-1,]*(z[t-1,]-0.95)^2 #update variance
+    R[t,] = 10^-4+sqrt(h[t,])*z[t,] #update return
+  }
+  
+  R_T2  = colSums(R,dims=1)
+  H_T2  = colSums(h,dims=1)
+  ret_adj = (R_T2+21*10^-4-mean(R_T2))*sqrt(m2_analytical)/sd(R_T2)
+  m1_mom[i] = mean(ret_adj)
+  m2_mom[i] = var(ret_adj)
+  
+}
+mean(m1_mom)-21*10^-4
+mean(m2_mom)-m2_analytical
+
+par(mfrow=c(1,2))
+hist(m1_mom)
+abline(v= 21*10^-4 ,col="blue",lwd=2)
+hist(m2_mom)
+abline(v= m2_analytical,col="blue",lwd=2)
+sd(m1_mom)
+sd(m2_mom)
+```
+## Q10. Calculate the 1% VaR of the portfolio for 1 day, and for 21 days.
+```{r}
+# Index
+library(fGarch)
+N=10^4
+T=21
+h_e = matrix(NA,T,N)
+R_e = matrix(NA,T,N)
+z_e = matrix(rstd(T*N, nu = 7), T, N) 
+h_e[1,] = 0.003 #initialize variance
+R_e[1,] = 10^-4 + sqrt(h_e[1,])*z_e[1,] #update return
+for (t in 2:T) {
+  h_e[t,] = 10^-6 + 0.8 *h_e[t-1,] + 0.1*h_e[t-1,]*(z_e[t-1,]-0.95)^2 #update variance
+  R_e[t,] = 10^-4+sqrt(h_e[t,])*z_e[t,] #update return
+}
+R_1 = R_e[1,]
+H_1 = h_e[1,]
+R_21  = colSums(R_e,dims=1)
+H_21  = colSums(h_e,dims=1)
+VAR_e_1 = -quantile(R_1,0.01) * 100
+VAR_e_21 = -quantile(R_21,0.01) * 100
+VAR_e_1
+VAR_e_21
+# stock A
+# we assume ht and mu to be 0.003 and 10^-4 respectively
+VAR_A_1 <- -(10^-4 + sqrt(0.006) * (-2.33))
+VAR_A_1
+VAR_A_21 <- -(21*10^-4 + sqrt(21) * sqrt(0.006) * (-2.33))
+VAR_A_21
+# Portfolio VAR
+VAR_P_1 <- 0.5*VAR_A_1 + 0.5*(-VAR_e_1) + 0.5*0.5*0.5*VAR_A_1*(-VAR_e_1)
+VAR_P_21 <- 0.5*VAR_A_21 + 0.5*(-VAR_e_21) + 0.5*0.5*0.5*VAR_A_21*(-VAR_e_21)
+VAR_P_1
+VAR_P_21
+```
